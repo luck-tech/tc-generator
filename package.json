@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "dotenvx run -- next dev",
-    "build": "dotenvx run -- next build",
+    "build": "next build",
     "start": "next start",
     "lint": "eslint",
     "db:push": "dotenvx run -- drizzle-kit push",
