@@ -7,7 +7,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL_PARSE = "gpt-4o-mini";
 const MODEL_GENERATE = "gpt-4o";
 const MAX_CHUNK_SIZE = 3000;
-const MAX_BATCH_CHARS = 6000;
+const MAX_BATCH_CHARS = 3000;
 const SCORE_THRESHOLD = 7;
 const MAX_RETRY = 2;
 
@@ -212,7 +212,7 @@ async function extractFeatures(
         },
         {
           role: "user",
-          content: `セクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
+          content: `以下のセクションから機能をJSON形式で抽出してください。\n\nセクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
         },
       ],
     });
@@ -294,12 +294,12 @@ async function generateViewpoints(
       },
       {
         role: "user",
-        content: `機能名: ${feature.name}
+        content: `以下の機能のテスト観点をJSON形式で網羅的に生成してください。
+
+機能名: ${feature.name}
 概要: ${feature.summary}
 ビジネスルール: ${feature.rules.join("; ")}
-${hintsText}
-
-この機能のテスト観点を網羅的に生成してください。`,
+${hintsText}`,
       },
     ],
   });
@@ -381,7 +381,9 @@ async function generateTestCase(
       },
       {
         role: "user",
-        content: `機能名: ${feature.name}
+        content: `以下の観点に対してテストケースをJSON形式で生成してください。
+
+機能名: ${feature.name}
 概要: ${feature.summary}
 ビジネスルール: ${feature.rules.join("; ")}
 
@@ -431,7 +433,7 @@ async function scoreTestCase(
       },
       {
         role: "user",
-        content: `以下のテストケースを採点してください:
+        content: `以下のテストケースを採点し、JSON形式で結果を返してください:
 タイトル: ${tc.title}
 目的: ${tc.objective}
 前提条件: ${tc.preconditions.join("; ")}
