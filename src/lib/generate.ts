@@ -37,8 +37,9 @@ const FEATURES_SCHEMA = {
               summary: { type: "string" },
               rules: { type: "array", items: { type: "string" } },
               source_sections: { type: "array", items: { type: "string" } },
+              page_url: { type: ["string", "null"] },
             },
-            required: ["name", "summary", "rules", "source_sections"],
+            required: ["name", "summary", "rules", "source_sections", "page_url"],
             additionalProperties: false,
           },
         },
@@ -158,13 +159,50 @@ const SCORE_SCHEMA = {
   },
 };
 
+// ========== Page Schema ==========
+
+const PAGES_SCHEMA = {
+  type: "json_schema" as const,
+  json_schema: {
+    name: "pages_extraction",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        pages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              name: { type: "string" },
+              description: { type: "string" },
+            },
+            required: ["url", "name", "description"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["pages"],
+      additionalProperties: false,
+    },
+  },
+};
+
 // ========== Types ==========
+
+interface Page {
+  url: string;
+  name: string;
+  description: string;
+}
 
 interface ExtractedFeature {
   name: string;
   summary: string;
   rules: string[];
   source_sections: string[];
+  page_url: string | null;
 }
 
 interface Viewpoint {
@@ -312,10 +350,49 @@ function batchSections(
   return batches;
 }
 
+// ========== Step 0: Extract Pages ==========
+
+async function extractPages(content: string): Promise<Page[]> {
+  console.log("[Step 0] ページ一覧抽出中...");
+
+  const response = await openai.chat.completions.create({
+    model: MODEL_CONFIG.parseSpec.model,
+    temperature: MODEL_CONFIG.parseSpec.temperature,
+    response_format: PAGES_SCHEMA,
+    messages: [
+      {
+        role: "system",
+        content: `あなたは仕様書分析の専門家です。仕様書からWebアプリケーションのページ（画面）一覧とそのURLを抽出してください。
+
+## ルール
+- 仕様書に記載されているURLパスを正確に抽出する
+- 動的パラメータを含むURL（例: /features/{id}）もそのまま抽出する
+- モーダルやドロップダウン等のページ内コンポーネントはページとして抽出しない
+- 共通レイアウト（サイドバー、ヘッダー等）は「共通」として1件にまとめる`,
+      },
+      {
+        role: "user",
+        content: `以下の仕様書からページ一覧をJSON形式で抽出してください。\n\n${content}`,
+      },
+    ],
+  });
+
+  const parsed = JSON.parse(
+    response.choices[0].message.content || '{"pages":[]}'
+  );
+  const pages = parsed.pages || [];
+  console.log(`  ${pages.length}ページを抽出`);
+  for (const p of pages) {
+    console.log(`    ${p.url} - ${p.name}`);
+  }
+  return pages;
+}
+
 // ========== Step 1: Extract Features ==========
 
 async function extractFeatures(
-  content: string
+  content: string,
+  pages: Page[]
 ): Promise<ExtractedFeature[]> {
   const sections = splitIntoSections(content);
   const batches = batchSections(sections);
@@ -343,11 +420,16 @@ async function extractFeatures(
 - featureは「システムが提供する振る舞いの単位」
 - 1セクションに複数の機能があれば全て抽出
 - セクションの一部しか記載がなくても機能候補として抽出してよい
-- ボタン1つの動作でも独立した振る舞いなら1機能`,
+
+## 重要: ページとの紐づけ
+各機能は必ず以下のページ一覧のいずれかに属します。page_urlにはそのページのURLを設定してください。
+どのページにも属さない場合はnullにしてください。
+
+${pages.map((p) => `- ${p.url}: ${p.name}（${p.description}）`).join("\n")}`,
         },
         {
           role: "user",
-          content: `以下のセクションから機能を抽出してJSON形式で出力してください。\n\nセクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
+          content: `以下のセクションから機能を抽出し、各機能をページに紐づけてJSON形式で出力してください。\n\nセクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
         },
       ],
     });
@@ -359,6 +441,7 @@ async function extractFeatures(
       allFeatures.push({
         name: f.name,
         summary: f.summary,
+        page_url: f.page_url || null,
         rules: f.rules || [],
         source_sections: f.source_sections || batch.ids,
       });
@@ -468,7 +551,7 @@ async function generateTestCase(
 - expected_resultは観測可能で具体的
   - NG:「正しく表示される」
   - OK:「検索結果にFeature名"ユーザー認証"が表示され、CUカバレッジ率が%付きで表示される」
-- urlは仕様書に画面URLの記載があれば必ず設定、なければnullにしてmissing_infoに記録
+- urlはこの機能が属するページのURLを設定すること（下記に記載あり）。ページURLが提供されている場合は必ずそれを使うこと
 - test_dataは具体的な値を含める
 - 1つのテスト観点から、必要に応じて複数のテストケースを生成してよい
 
@@ -485,6 +568,7 @@ async function generateTestCase(
         content: `以下の観点に対してテストケースをJSON形式で生成してください。
 
 機能名: ${feature.name}
+ページURL: ${feature.page_url || "（不明）"}
 概要: ${feature.summary}
 ビジネスルール: ${feature.rules.join("; ")}
 
@@ -563,8 +647,11 @@ export async function runGeneration(documentId: string): Promise<void> {
       .where(eq(documents.id, documentId));
     if (!doc) throw new Error("Document not found");
 
-    // Step 1: Extract features (batched)
-    const extractedFeatures = await extractFeatures(doc.content);
+    // Step 0: Extract pages
+    const pages = await extractPages(doc.content);
+
+    // Step 1: Extract features (batched, with page mapping)
+    const extractedFeatures = await extractFeatures(doc.content, pages);
 
     const savedFeatures: { id: string; feature: ExtractedFeature }[] = [];
     for (const f of extractedFeatures) {
