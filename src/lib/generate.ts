@@ -4,12 +4,159 @@ import { documents, features, testCases } from "./db/schema";
 import { eq } from "drizzle-orm";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const MODEL_PARSE = "gpt-4o-mini";
-const MODEL_GENERATE = "gpt-4o";
+
+// Model config (ai-test-generator準拠)
+const MODEL_CONFIG = {
+  parseSpec: { model: "gpt-4o-mini" as const, temperature: 0.1 },
+  generateViewpoints: { model: "gpt-4o" as const, temperature: 0.2 },
+  generateTestCases: { model: "gpt-4o" as const, temperature: 0.4 },
+  scoreTestCase: { model: "gpt-4o-mini" as const, temperature: 0.0 },
+};
+
 const MAX_CHUNK_SIZE = 3000;
 const MAX_BATCH_CHARS = 3000;
 const SCORE_THRESHOLD = 7;
 const MAX_RETRY = 2;
+
+// ========== Structured Output Schemas ==========
+
+const FEATURES_SCHEMA = {
+  type: "json_schema" as const,
+  json_schema: {
+    name: "features_extraction",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        features: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              summary: { type: "string" },
+              rules: { type: "array", items: { type: "string" } },
+              source_sections: { type: "array", items: { type: "string" } },
+            },
+            required: ["name", "summary", "rules", "source_sections"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["features"],
+      additionalProperties: false,
+    },
+  },
+};
+
+const VIEWPOINTS_SCHEMA = {
+  type: "json_schema" as const,
+  json_schema: {
+    name: "viewpoints_generation",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        viewpoints: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              description: { type: "string" },
+              priority: { type: "string", enum: ["high", "medium", "low"] },
+            },
+            required: ["title", "description", "priority"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["viewpoints"],
+      additionalProperties: false,
+    },
+  },
+};
+
+const TEST_CASES_SCHEMA = {
+  type: "json_schema" as const,
+  json_schema: {
+    name: "test_cases_generation",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        test_cases: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              viewpoint: { type: "string" },
+              title: { type: "string" },
+              objective: { type: "string" },
+              preconditions: { type: "array", items: { type: "string" } },
+              url: { type: ["string", "null"] },
+              test_data: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    field: { type: "string" },
+                    value: { type: "string" },
+                  },
+                  required: ["field", "value"],
+                  additionalProperties: false,
+                },
+              },
+              steps: { type: "array", items: { type: "string" } },
+              expected_result: { type: "string" },
+              priority: { type: "string", enum: ["high", "medium", "low"] },
+              test_type: {
+                type: "string",
+                enum: ["ui_manual", "api_auto", "e2e_auto"],
+              },
+              missing_info: { type: "array", items: { type: "string" } },
+            },
+            required: [
+              "viewpoint",
+              "title",
+              "objective",
+              "preconditions",
+              "url",
+              "test_data",
+              "steps",
+              "expected_result",
+              "priority",
+              "test_type",
+              "missing_info",
+            ],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["test_cases"],
+      additionalProperties: false,
+    },
+  },
+};
+
+const SCORE_SCHEMA = {
+  type: "json_schema" as const,
+  json_schema: {
+    name: "score_result",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        passed: { type: "boolean" },
+        score: { type: "number" },
+        issues: { type: "array", items: { type: "string" } },
+        fix_instructions: { type: "array", items: { type: "string" } },
+      },
+      required: ["passed", "score", "issues", "fix_instructions"],
+      additionalProperties: false,
+    },
+  },
+};
 
 // ========== Types ==========
 
@@ -112,7 +259,6 @@ function splitIntoSections(content: string): { id: string; text: string }[] {
   for (const line of lines) {
     if (line.startsWith("##") && current.trim()) {
       if (current.length > MAX_CHUNK_SIZE) {
-        // Split oversized sections
         const subChunks = splitBySize(current, MAX_CHUNK_SIZE);
         for (const chunk of subChunks) {
           sections.push({ id: `sec-${sectionId++}`, text: chunk });
@@ -166,7 +312,7 @@ function batchSections(
   return batches;
 }
 
-// ========== Step 1: Extract Features (Batched) ==========
+// ========== Step 1: Extract Features ==========
 
 async function extractFeatures(
   content: string
@@ -185,8 +331,9 @@ async function extractFeatures(
     console.log(`  バッチ ${i + 1}/${batches.length}`);
 
     const response = await openai.chat.completions.create({
-      model: MODEL_PARSE,
-      response_format: { type: "json_object" },
+      model: MODEL_CONFIG.parseSpec.model,
+      temperature: MODEL_CONFIG.parseSpec.temperature,
+      response_format: FEATURES_SCHEMA,
       messages: [
         {
           role: "system",
@@ -196,23 +343,11 @@ async function extractFeatures(
 - featureは「システムが提供する振る舞いの単位」
 - 1セクションに複数の機能があれば全て抽出
 - セクションの一部しか記載がなくても機能候補として抽出してよい
-- ボタン1つの動作でも独立した振る舞いなら1機能
-
-## 出力形式
-{
-  "features": [
-    {
-      "name": "機能名（日本語、簡潔に）",
-      "summary": "機能の概要（具体的に）",
-      "rules": ["ビジネスルール/制約1", "ルール2"],
-      "source_sections": ["セクションID"]
-    }
-  ]
-}`,
+- ボタン1つの動作でも独立した振る舞いなら1機能`,
         },
         {
           role: "user",
-          content: `以下のセクションから機能をJSON形式で抽出してください。\n\nセクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
+          content: `以下のセクションから機能を抽出してJSON形式で出力してください。\n\nセクションID: ${batch.ids.join(", ")}\n\n${batch.text}`,
         },
       ],
     });
@@ -236,9 +371,7 @@ async function extractFeatures(
   for (const f of allFeatures) {
     const existing = unique.get(f.name);
     if (existing) {
-      existing.rules = [
-        ...new Set([...existing.rules, ...f.rules]),
-      ];
+      existing.rules = [...new Set([...existing.rules, ...f.rules])];
       existing.source_sections = [
         ...new Set([...existing.source_sections, ...f.source_sections]),
       ];
@@ -252,11 +385,10 @@ async function extractFeatures(
   return result;
 }
 
-// ========== Step 2: Generate Viewpoints (Per Feature + Coverage Hints) ==========
+// ========== Step 2: Generate Viewpoints ==========
 
 async function generateViewpoints(
-  feature: ExtractedFeature,
-  specContent: string
+  feature: ExtractedFeature
 ): Promise<Viewpoint[]> {
   const hints = getCoverageHints(feature.name, feature.summary);
   const hintsText =
@@ -265,8 +397,9 @@ async function generateViewpoints(
       : "";
 
   const response = await openai.chat.completions.create({
-    model: MODEL_GENERATE,
-    response_format: { type: "json_object" },
+    model: MODEL_CONFIG.generateViewpoints.model,
+    temperature: MODEL_CONFIG.generateViewpoints.temperature,
+    response_format: VIEWPOINTS_SCHEMA,
     messages: [
       {
         role: "system",
@@ -279,18 +412,7 @@ async function generateViewpoints(
 - ロール/権限: 管理者、一般ユーザー、未認証、権限の有無
 - エラー: タイムアウト、API失敗、通信制御、バリデーション
 - UI/UX: 表示崩れ、ローディング、ボタン活性/非活性、空状態表示
-- パフォーマンス: 大量データ、連続操作、同時アクセス
-
-## 出力形式
-{
-  "viewpoints": [
-    {
-      "title": "観点タイトル（日本語、具体的に）",
-      "description": "何をテストするか（日本語）",
-      "priority": "high" | "medium" | "low"
-    }
-  ]
-}`,
+- パフォーマンス: 大量データ、連続操作、同時アクセス`,
       },
       {
         role: "user",
@@ -310,13 +432,12 @@ ${hintsText}`,
   return parsed.viewpoints || [];
 }
 
-// ========== Step 3: Generate Test Cases (Per Viewpoint) ==========
+// ========== Step 3: Generate Test Cases ==========
 
 async function generateTestCase(
   feature: ExtractedFeature,
   viewpoint: Viewpoint,
   otherViewpoints: Viewpoint[],
-  specContent: string,
   fixContext?: { issues: string[]; fix_instructions: string[] }
 ): Promise<GeneratedTC[]> {
   const otherVPText =
@@ -329,8 +450,9 @@ async function generateTestCase(
     : "";
 
   const response = await openai.chat.completions.create({
-    model: MODEL_GENERATE,
-    response_format: { type: "json_object" },
+    model: MODEL_CONFIG.generateTestCases.model,
+    temperature: MODEL_CONFIG.generateTestCases.temperature,
+    response_format: TEST_CASES_SCHEMA,
     messages: [
       {
         role: "system",
@@ -346,38 +468,17 @@ async function generateTestCase(
 - expected_resultは観測可能で具体的
   - NG:「正しく表示される」
   - OK:「検索結果にFeature名"ユーザー認証"が表示され、CUカバレッジ率が%付きで表示される」
-- urlは仕様書に記載があれば必ず設定。なければnullにしてmissing_infoに記録
-- test_dataは具体的な値を含める（例: {"field": "feature_name", "value": "ユーザー認証OAuth2.0"}）
+- urlは仕様書に画面URLの記載があれば必ず設定、なければnullにしてmissing_infoに記録
+- test_dataは具体的な値を含める
 - 1つのテスト観点から、必要に応じて複数のテストケースを生成してよい
 
-## test_typeの判定
+## test_type判定ルール
 - URLがあり画面操作系 → "ui_manual"
 - APIのリクエスト/レスポンス系 → "api_auto"
 - 複数画面をまたぐフロー系 → "e2e_auto"
 
 ## missing_infoの記録
-仕様書から取得できなかった情報を具体的に記録:
-- 例: ["url: 設定画面のURLが仕様書に記載なし"]
-- 例: ["test_data: エラー発生の具体的なトリガーが仕様書に記載なし"]
-
-## 出力形式
-{
-  "test_cases": [
-    {
-      "viewpoint": "対応するテスト観点タイトル",
-      "title": "テストケースタイトル（日本語15文字以上）",
-      "objective": "テスト目的（日本語25文字以上）",
-      "preconditions": ["前提条件1", "前提条件2"],
-      "url": "/features" or null,
-      "test_data": [{"field": "フィールド名", "value": "具体値"}],
-      "steps": ["手順1", "手順2", "手順3"],
-      "expected_result": "期待結果（観測可能、具体的、60文字以上）",
-      "priority": "high",
-      "test_type": "ui_manual",
-      "missing_info": []
-    }
-  ]
-}`,
+仕様書から取得できなかった情報を具体的に記録`,
       },
       {
         role: "user",
@@ -390,9 +491,7 @@ async function generateTestCase(
 テスト観点: ${viewpoint.title}
 観点の説明: ${viewpoint.description}
 優先度: ${viewpoint.priority}
-${otherVPText}${fixText}
-
-この観点に対してテストケースを生成してください。`,
+${otherVPText}${fixText}`,
       },
     ],
   });
@@ -405,31 +504,21 @@ ${otherVPText}${fixText}
 
 // ========== Scorer ==========
 
-async function scoreTestCase(
-  tc: GeneratedTC
-): Promise<ScoreResult> {
+async function scoreTestCase(tc: GeneratedTC): Promise<ScoreResult> {
   const response = await openai.chat.completions.create({
-    model: MODEL_PARSE,
-    response_format: { type: "json_object" },
+    model: MODEL_CONFIG.scoreTestCase.model,
+    temperature: MODEL_CONFIG.scoreTestCase.temperature,
+    response_format: SCORE_SCHEMA,
     messages: [
       {
         role: "system",
         content: `あなたはテストケースの品質を採点する審査AIです。
-採点基準に従い、スコアと問題点を返してください。
 
 ## 採点基準（合計10点満点）
 - steps (0-3点): 4ステップ以上で具体的な画面遷移・操作・確認 → 3点
 - preconditions (0-2点): 権限、データ件数、画面状態など3項目以上 → 2点
 - expected_result (0-3点): 画面状態・文言・数値が60文字以上で具体的 → 3点
-- title_objective (0-2点): titleが15文字以上かつobjectiveが25文字以上 → 2点
-
-## 出力形式
-{
-  "passed": true/false,
-  "score": 8,
-  "issues": ["stepsが2ステップしかない"],
-  "fix_instructions": ["手順を4ステップ以上に増やし、具体的な操作を記述してください"]
-}`,
+- title_objective (0-2点): titleが15文字以上かつobjectiveが25文字以上 → 2点`,
       },
       {
         role: "user",
@@ -444,7 +533,8 @@ async function scoreTestCase(
   });
 
   const parsed = JSON.parse(
-    response.choices[0].message.content || '{"passed":true,"score":10,"issues":[],"fix_instructions":[]}'
+    response.choices[0].message.content ||
+      '{"passed":true,"score":10,"issues":[],"fix_instructions":[]}'
   );
   return {
     passed: parsed.score >= SCORE_THRESHOLD,
@@ -503,19 +593,19 @@ export async function runGeneration(documentId: string): Promise<void> {
     for (const { id: featureId, feature } of savedFeatures) {
       console.log(`\n[Step 2] 機能: ${feature.name}`);
 
-      // Generate viewpoints with coverage hints
-      const viewpoints = await generateViewpoints(feature, doc.content);
+      const viewpoints = await generateViewpoints(feature);
       console.log(`  観点: ${viewpoints.length}件`);
       await sleep(300);
 
-      // Generate TCs per viewpoint (not batched!)
       for (let vi = 0; vi < viewpoints.length; vi++) {
         const vp = viewpoints[vi];
         const otherVPs = viewpoints.filter((_, j) => j !== vi);
 
-        console.log(`  [Step 3] 観点 ${vi + 1}/${viewpoints.length}: ${vp.title}`);
+        console.log(
+          `  [Step 3] 観点 ${vi + 1}/${viewpoints.length}: ${vp.title}`
+        );
 
-        let tcs = await generateTestCase(feature, vp, otherVPs, doc.content);
+        let tcs = await generateTestCase(feature, vp, otherVPs);
         await sleep(300);
 
         // Score and retry
@@ -524,21 +614,22 @@ export async function runGeneration(documentId: string): Promise<void> {
           const scoreResult = await scoreTestCase(tc);
 
           if (!scoreResult.passed) {
-            console.log(`    TC "${tc.title.substring(0, 20)}..." スコア${scoreResult.score}/10 → 再生成`);
+            console.log(
+              `    TC "${tc.title.substring(0, 20)}..." スコア${scoreResult.score}/10 → 再生成`
+            );
 
             for (let retry = 0; retry < MAX_RETRY; retry++) {
-              const improved = await generateTestCase(
-                feature,
-                vp,
-                otherVPs,
-                doc.content,
-                { issues: scoreResult.issues, fix_instructions: scoreResult.fix_instructions }
-              );
+              const improved = await generateTestCase(feature, vp, otherVPs, {
+                issues: scoreResult.issues,
+                fix_instructions: scoreResult.fix_instructions,
+              });
               if (improved.length > 0) {
                 const newScore = await scoreTestCase(improved[0]);
                 if (newScore.passed) {
                   tcs[tci] = improved[0];
-                  console.log(`    再生成成功: スコア${newScore.score}/10`);
+                  console.log(
+                    `    再生成成功: スコア${newScore.score}/10`
+                  );
                   break;
                 }
               }
